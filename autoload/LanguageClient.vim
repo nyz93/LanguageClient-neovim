@@ -231,7 +231,8 @@ function! s:Edit(action, path) abort
         return
     endif
 
-    execute l:action . ' ' . fnameescape(a:path)
+
+    execute l:action . ' ' . fnameescape(LSP#reresolve(a:path))
 endfunction
 
 " Batch version of `matchdelete()`.

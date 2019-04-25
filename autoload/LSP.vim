@@ -1,12 +1,38 @@
 " TODO: make buffer aware.
-
+"
+function! LSP#reresolve(path)
+	if get(g:, "LanguageClient_unresolveFilenames")
+		let l:real_pwd = trim(system("pwd"), "\r\n ")
+		let l:resolved_pwd = getcwd()
+		if l:real_pwd != l:resolved_pwd
+			return substitute(a:path, "^" . l:real_pwd, l:resolved_pwd, "")
+		else
+			return a:path
+		endif
+	else
+		return a:path
+	endif
+endfunction
+function! LSP#unresolve(path)
+	if get(g:, "LanguageClient_unresolveFilenames")
+		let l:real_pwd = trim(system("pwd"), "\r\n ")
+		let l:resolved_pwd = getcwd()
+		if l:real_pwd != l:resolved_pwd
+			return substitute(a:path, "^" . l:resolved_pwd, l:real_pwd, "")
+		else
+			return a:path
+		endif
+	else
+		return a:path
+	endif
+endfunction
 function! LSP#filename() abort
     " When executing autocommand, `%` might have already changed.
     let l:filename = expand('<afile>:p')
     if !l:filename
         let l:filename = expand('%:p')
     endif
-    return l:filename
+    return LSP#unresolve(l:filename)
 endfunction
 
 " This function will return buffer text as required by LSP.

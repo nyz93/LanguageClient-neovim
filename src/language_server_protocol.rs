@@ -11,6 +11,7 @@ use itertools::Itertools;
 use notify::Watcher;
 use std::sync::mpsc;
 use vim::try_get;
+use path_clean::PathClean;
 
 impl LanguageClient {
     pub fn get_client(&self, lang_id: &LanguageId) -> Fallible<RpcClient> {
@@ -1751,13 +1752,11 @@ impl LanguageClient {
             return Ok(());
         }
 
-        let mut filename = params.uri.filepath()?.to_string_lossy().into_owned();
+        let mut filename = params.uri.filepath()?.clean().to_string_lossy().into_owned();
         // Workaround bug: remove first '/' in case of '/C:/blabla'.
         if filename.chars().nth(0) == Some('/') && filename.chars().nth(2) == Some(':') {
             filename.remove(0);
         }
-        // Unify name to avoid mismatch due to case insensitivity.
-        let filename = filename.canonicalize();
 
         let mut diagnostics = params.diagnostics;
         diagnostics.sort_by_key(
@@ -2702,6 +2701,8 @@ impl LanguageClient {
     pub fn languageClient_startServer(&self, params: &Value) -> Fallible<Value> {
         info!("Begin {}", REQUEST__StartServer);
         let filename = self.vim()?.get_filename(params)?;
+        let dbg_msg = format!("filename: {}", &filename);
+        self.vim()?.echomsg_ellipsis(&dbg_msg)?;
         let languageId = self.vim()?.get_languageId(&filename, params)?;
         let cmdargs: Vec<String> = try_get("cmdargs", params)?.unwrap_or_default();
         let cmdparams = vim_cmd_args_to_value(&cmdargs)?;
