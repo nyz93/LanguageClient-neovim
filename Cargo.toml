@@ -20,8 +20,8 @@ path-clean = "0.1.0"
 
 crossbeam-channel = "0.3"
 
-jsonrpc-core = "10"
-lsp-types = "0.56"
+jsonrpc-core = "12"
+lsp-types = "0.57"
 url = "1"
 pathdiff = "0"
 diff = "0"

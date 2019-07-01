@@ -1047,42 +1047,36 @@ impl LanguageClient {
 
         let response: Option<GotoDefinitionResponse> = result.clone().to_lsp()?;
 
-        match response {
-            None => {
-                self.vim()?.echowarn("Not found!")?;
-                return Ok(Value::Null);
-            }
-            Some(GotoDefinitionResponse::Scalar(loc)) => {
+        let locations = match response {
+            None => vec![],
+            Some(GotoDefinitionResponse::Scalar(loc)) => vec![loc],
+            Some(GotoDefinitionResponse::Array(arr)) => arr,
+            Some(GotoDefinitionResponse::Link(links)) => links
+                .into_iter()
+                .map(|link| Location::new(link.target_uri, link.target_selection_range))
+                .collect(),
+        };
+
+        match locations.len() {
+            0 => self.vim()?.echowarn("Not found!")?,
+            1 => {
+                let loc = locations.get(0).ok_or_else(|| err_msg("Not found!"))?;
                 self.vim()?.edit(&goto_cmd, loc.uri.filepath()?)?;
                 self.vim()?
                     .cursor(loc.range.start.line + 1, loc.range.start.character + 1)?;
+                let cur_file: String = self.vim()?.eval("expand('%')")?;
+                self.vim()?.echomsg_ellipsis(format!(
+                    "{} {}:{}",
+                    cur_file,
+                    loc.range.start.line + 1,
+                    loc.range.start.character + 1
+                ))?;
             }
-            Some(GotoDefinitionResponse::Array(arr)) => match arr.len() {
-                0 => self.vim()?.echowarn("Not found!")?,
-                1 => {
-                    let loc = arr.get(0).ok_or_else(|| err_msg("Not found!"))?;
-                    self.vim()?.edit(&goto_cmd, loc.uri.filepath()?)?;
-                    self.vim()?
-                        .cursor(loc.range.start.line + 1, loc.range.start.character + 1)?;
-                    let cur_file: String = self.vim()?.eval("expand('%')")?;
-                    self.vim()?.echomsg_ellipsis(format!(
-                        "{} {}:{}",
-                        cur_file,
-                        loc.range.start.line + 1,
-                        loc.range.start.character + 1
-                    ))?;
-                }
-                _ => {
-                    let title = format!("[LC]: search for {}", current_word);
-                    self.display_locations(&arr, &title)?
-                }
-            },
-            Some(GotoDefinitionResponse::Link(_)) => {
-                self.vim()?
-                    .echowarn("Definition links are not supported!")?;
-                return Ok(Value::Null);
+            _ => {
+                let title = format!("[LC]: search for {}", current_word);
+                self.display_locations(&locations, &title)?
             }
-        };
+        }
 
         info!("End {}", method);
         Ok(result)
@@ -1243,15 +1237,37 @@ impl LanguageClient {
             },
         )?;
 
-        let commands: Vec<Command> = serde_json::from_value(result.clone())?;
+        let response: CodeActionResponse = serde_json::from_value(result.clone())?;
 
-        let source: Vec<_> = commands
+        // Convert any Commands into CodeActions, so that the remainder of the handling can be
+        // shared.
+        let actions = match response {
+            CodeActionResponse::Commands(commands) => commands
+                .into_iter()
+                .map(|command| CodeAction {
+                    title: command.title.clone(),
+                    kind: Some(command.command.clone()),
+                    diagnostics: None,
+                    edit: None,
+                    command: Some(command),
+                })
+                .collect(),
+            CodeActionResponse::Actions(actions) => actions,
+        };
+
+        let source: Vec<_> = actions
             .iter()
-            .map(|cmd| format!("{}: {}", cmd.command, cmd.title))
+            .map(|action| {
+                format!(
+                    "{}: {}",
+                    action.kind.as_ref().map_or("action", String::as_ref),
+                    action.title
+                )
+            })
             .collect();
 
         self.update(|state| {
-            state.stashed_codeAction_commands = commands;
+            state.stashed_codeAction_actions = actions;
             Ok(())
         })?;
 
@@ -2466,38 +2482,46 @@ impl LanguageClient {
         let selection: String =
             try_get("selection", params)?.ok_or_else(|| err_msg("selection not found!"))?;
         let tokens: Vec<&str> = selection.splitn(2, ": ").collect();
-        let command = tokens
+        let kind = tokens
             .get(0)
             .cloned()
-            .ok_or_else(|| format_err!("Failed to get command! tokens: {:?}", tokens))?;
+            .ok_or_else(|| format_err!("Failed to get kind! tokens: {:?}", tokens))?;
         let title = tokens
             .get(1)
             .cloned()
             .ok_or_else(|| format_err!("Failed to get title! tokens: {:?}", tokens))?;
-        let entry = self.get(|state| {
-            let commands = &state.stashed_codeAction_commands;
+        let action = self.get(|state| {
+            let actions = &state.stashed_codeAction_actions;
 
-            commands
+            actions
                 .iter()
-                .find(|e| e.command == command && e.title == title)
+                .find(|action| {
+                    action.kind.as_ref().map_or(kind, String::as_ref) == kind
+                        && action.title == title
+                })
                 .cloned()
                 .ok_or_else(|| {
-                    format_err!("No stashed command found! stashed commands: {:?}", commands)
+                    format_err!("No stashed action found! stashed actions: {:?}", actions)
                 })
         })??;
 
-        if self.try_handle_command_by_client(&entry)? {
-            return Ok(());
+        // Apply edit before command.
+        if let Some(edit) = &action.edit {
+            self.apply_WorkspaceEdit(edit)?;
         }
 
-        let params = json!({
-            "command": entry.command,
-            "arguments": entry.arguments,
-        });
-        self.workspace_executeCommand(&params)?;
+        if let Some(command) = &action.command {
+            if !self.try_handle_command_by_client(&command)? {
+                let params = json!({
+                "command": command.command,
+                "arguments": command.arguments,
+                });
+                self.workspace_executeCommand(&params)?;
+            }
+        }
 
         self.update(|state| {
-            state.stashed_codeAction_commands = vec![];
+            state.stashed_codeAction_actions = vec![];
             Ok(())
         })?;
 
