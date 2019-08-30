@@ -55,8 +55,6 @@ pub const NOTIFICATION__WindowProgress: &str = "window/progress";
 pub const NOTIFICATION__LanguageStatus: &str = "language/status";
 pub const REQUEST__ClassFileContents: &str = "java/classFileContents";
 
-pub const CommandsClient: &[&str] = &["java.apply.workspaceEdit"];
-
 // Vim variable names
 pub const VIM__ServerStatus: &str = "g:LanguageClient_serverStatus";
 pub const VIM__ServerStatusMessage: &str = "g:LanguageClient_serverStatusMessage";
@@ -137,7 +135,7 @@ pub struct State {
     pub is_nvim: bool,
     pub last_cursor_line: u64,
     pub last_line_diagnostic: String,
-    pub stashed_codeAction_commands: Vec<Command>,
+    pub stashed_codeAction_actions: Vec<CodeAction>,
     pub viewports: HashMap<String, Viewport>,
 
     // User settings.
@@ -150,6 +148,7 @@ pub struct State {
     pub diagnosticsList: DiagnosticsList,
     pub diagnosticsDisplay: HashMap<u64, DiagnosticsDisplay>,
     pub diagnosticsSignsMax: Option<u64>,
+    pub diagnostics_max_severity: DiagnosticSeverity,
     pub documentHighlightDisplay: HashMap<u64, DocumentHighlightDisplay>,
     pub windowLogMessageLevel: MessageType,
     pub settingsPath: String,
@@ -213,7 +212,7 @@ impl State {
             is_nvim: false,
             last_cursor_line: 0,
             last_line_diagnostic: " ".into(),
-            stashed_codeAction_commands: vec![],
+            stashed_codeAction_actions: vec![],
             viewports: HashMap::new(),
 
             serverCommands: HashMap::new(),
@@ -225,6 +224,7 @@ impl State {
             diagnosticsList: DiagnosticsList::Quickfix,
             diagnosticsDisplay: DiagnosticsDisplay::default(),
             diagnosticsSignsMax: None,
+            diagnostics_max_severity: DiagnosticSeverity::Hint,
             documentHighlightDisplay: DocumentHighlightDisplay::default(),
             windowLogMessageLevel: MessageType::Warning,
             settingsPath: format!(".vim{}settings.json", std::path::MAIN_SEPARATOR),
@@ -1032,4 +1032,10 @@ pub struct VirtualText {
     pub line: u64,
     pub text: String,
     pub hl_group: String,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceEditWithCursor {
+    pub workspaceEdit: WorkspaceEdit,
+    pub cursorPosition: TextDocumentPositionParams,
 }

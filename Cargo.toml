@@ -1,6 +1,6 @@
 [package]
 name = "languageclient"
-version = "0.1.146"
+version = "0.1.147"
 authors = ["Junfeng Li <autozimu@gmail.com>"]
 description = "Language Server Protocol (LSP) support for vim and neovim"
 publish = false
@@ -20,16 +20,15 @@ path-clean = "0.1.0"
 
 crossbeam-channel = "0.3"
 
-jsonrpc-core = "10"
-lsp-types = "0.56"
-url = "1"
+jsonrpc-core = "13"
+lsp-types = "0.60"
+url = "2"
 pathdiff = "0"
 diff = "0"
 regex = "1"
 glob = "0"
 notify = "4"
 shellexpand = "1"
-lazycell = "1"
 
 [package.metadata.release]
 no-dev-version = true

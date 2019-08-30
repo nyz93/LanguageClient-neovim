@@ -113,13 +113,15 @@ impl LanguageClient {
 
         let (
             diagnosticsSignsMax,
+            diagnostics_max_severity,
             documentHighlightDisplay,
             selectionUI_autoOpen,
             use_virtual_text,
             echo_project_root,
-        ): (Option<u64>, Value, u8, u8, u8) = self.vim()?.eval(
+        ): (Option<u64>, String, Value, u8, u8, u8) = self.vim()?.eval(
             [
                 "get(g:, 'LanguageClient_diagnosticsSignsMax', v:null)",
+                "get(g:, 'LanguageClient_diagnosticsMaxSeverity', 'Hint')",
                 "get(g:, 'LanguageClient_documentHighlightDisplay', {})",
                 "!!s:GetVar('LanguageClient_selectionUI_autoOpen', 1)",
                 "s:useVirtualText()",
@@ -185,6 +187,18 @@ impl LanguageClient {
 
         let is_nvim = is_nvim == 1;
 
+        let diagnostics_max_severity = match diagnostics_max_severity.to_ascii_uppercase().as_str()
+        {
+            "ERROR" => DiagnosticSeverity::Error,
+            "WARNING" => DiagnosticSeverity::Warning,
+            "INFORMATION" => DiagnosticSeverity::Information,
+            "HINT" => DiagnosticSeverity::Hint,
+            _ => bail!(
+                "Invalid option for LanguageClient_diagnosticsMaxSeverity: {}",
+                diagnostics_max_severity
+            ),
+        };
+
         self.update(|state| {
             state.autoStart = autoStart;
             state.serverCommands.extend(serverCommands);
@@ -197,6 +211,7 @@ impl LanguageClient {
                 serde_json::to_value(&state.diagnosticsDisplay)?.combine(&diagnosticsDisplay),
             )?;
             state.diagnosticsSignsMax = diagnosticsSignsMax;
+            state.diagnostics_max_severity = diagnostics_max_severity;
             state.documentHighlightDisplay = serde_json::from_value(
                 serde_json::to_value(&state.documentHighlightDisplay)?
                     .combine(&documentHighlightDisplay),
@@ -252,9 +267,11 @@ impl LanguageClient {
     }
 
     fn apply_WorkspaceEdit(&self, edit: &WorkspaceEdit) -> Fallible<()> {
+        use self::{DocumentChangeOperation::*, ResourceOp::*};
+
         debug!("Begin apply WorkspaceEdit: {:?}", edit);
-        let filename = self.vim()?.get_filename(&Value::Null)?;
-        let position = self.vim()?.get_position(&Value::Null)?;
+        let mut filename = self.vim()?.get_filename(&Value::Null)?;
+        let mut position = self.vim()?.get_position(&Value::Null)?;
 
         if let Some(ref changes) = edit.document_changes {
             match changes {
@@ -265,10 +282,19 @@ impl LanguageClient {
                 }
                 DocumentChanges::Operations(ref ops) => {
                     for op in ops {
-                        if let DocumentChangeOperation::Edit(ref e) = op {
-                            self.apply_TextEdits(&e.text_document.uri.filepath()?, &e.edits)?;
+                        match op {
+                            Edit(ref e) => {
+                                self.apply_TextEdits(&e.text_document.uri.filepath()?, &e.edits)?
+                            }
+                            Op(ref rop) => match rop {
+                                Create(file) => {
+                                    filename = file.uri.filepath()?.to_string_lossy().into_owned();
+                                    position = Position::default();
+                                }
+                                Rename(_file) => bail!("file renaming not yet supported."),
+                                Delete(_file) => bail!("file deletion not yet supported."),
+                            },
                         }
-                        // TODO: handle ResourceOp.
                     }
                 }
             }
@@ -277,7 +303,7 @@ impl LanguageClient {
                 self.apply_TextEdits(&uri.filepath()?, edits)?;
             }
         }
-        self.vim()?.edit(&None, &filename)?;
+        self.edit(&None, &filename)?;
         self.vim()?
             .cursor(position.line + 1, position.character + 1)?;
         debug!("End apply WorkspaceEdit");
@@ -411,7 +437,7 @@ impl LanguageClient {
         edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
         edits.reverse();
 
-        self.vim()?.edit(&None, path)?;
+        self.edit(&None, path)?;
 
         let mut lines: Vec<String> = self.vim()?.rpcclient.call("getline", json!([1, '$']))?;
         let lines_len_prev = lines.len();
@@ -488,12 +514,12 @@ impl LanguageClient {
             let line = entry.range.start.line;
             let mut msg = String::new();
             if let Some(severity) = entry.severity {
-                msg += &format!("[{:?}]", severity);
+                msg += &format!("[{:?}] ", severity);
             }
             if let Some(ref code) = entry.code {
                 let s = code.to_string();
                 if !s.is_empty() {
-                    msg += &format!("[{}]", s);
+                    msg += &format!("[{}] ", s);
                 }
             }
             msg += &entry.message;
@@ -795,19 +821,28 @@ impl LanguageClient {
     }
 
     fn try_handle_command_by_client(&self, cmd: &Command) -> Fallible<bool> {
-        if !CommandsClient.contains(&cmd.command.as_str()) {
-            return Ok(false);
-        }
-
-        if cmd.command == "java.apply.workspaceEdit" {
-            if let Some(ref edits) = cmd.arguments {
-                for edit in edits {
-                    let edit: WorkspaceEdit = serde_json::from_value(edit.clone())?;
-                    self.apply_WorkspaceEdit(&edit)?;
+        match cmd.command.as_str() {
+            "java.apply.workspaceEdit" => {
+                if let Some(ref edits) = cmd.arguments {
+                    for edit in edits {
+                        let edit: WorkspaceEdit = serde_json::from_value(edit.clone())?;
+                        self.apply_WorkspaceEdit(&edit)?;
+                    }
                 }
             }
-        } else {
-            bail!("Not implemented: {}", cmd.command);
+            "rust-analyzer.applySourceChange" => {
+                if let Some(ref edits) = cmd.arguments {
+                    for edit in edits {
+                        let edit: WorkspaceEditWithCursor = serde_json::from_value(edit.clone())?;
+                        self.apply_WorkspaceEdit(&edit.workspaceEdit)?;
+                        self.vim()?.cursor(
+                            edit.cursorPosition.position.line + 1,
+                            edit.cursorPosition.position.character + 1,
+                        )?;
+                    }
+                }
+            }
+            _ => return Ok(false),
         }
 
         Ok(true)
@@ -875,6 +910,16 @@ impl LanguageClient {
         Ok(())
     }
 
+    fn edit(&self, goto_cmd: &Option<String>, path: impl AsRef<Path>) -> Fallible<()> {
+        let path = path.as_ref().to_string_lossy();
+        if path.starts_with("jdt://") {
+            self.java_classFileContents(&json!({ "gotoCmd": goto_cmd, "uri": path }))?;
+            Ok(())
+        } else {
+            self.vim()?.edit(&goto_cmd, path.into_owned())
+        }
+    }
+
     /////// LSP ///////
 
     fn initialize(&self, params: &Value) -> Fallible<Value> {
@@ -901,7 +946,7 @@ impl LanguageClient {
             Some(initialization_options)
         };
 
-        let trace = self.get(|state| state.trace.clone())?;
+        let trace = self.get(|state| state.trace)?;
 
         let result: Value = self.get_client(&Some(languageId.clone()))?.call(
             lsp::request::Initialize::METHOD,
@@ -927,6 +972,26 @@ impl LanguageClient {
                                 }),
                             }),
                             ..SignatureHelpCapability::default()
+                        }),
+                        declaration: Some(GotoCapability {
+                            link_support: Some(true),
+                            ..GotoCapability::default()
+                        }),
+                        definition: Some(GotoCapability {
+                            link_support: Some(true),
+                            ..GotoCapability::default()
+                        }),
+                        type_definition: Some(GotoCapability {
+                            link_support: Some(true),
+                            ..GotoCapability::default()
+                        }),
+                        implementation: Some(GotoCapability {
+                            link_support: Some(true),
+                            ..GotoCapability::default()
+                        }),
+                        publish_diagnostics: Some(PublishDiagnosticsCapability {
+                            related_information: Some(true),
+                            ..PublishDiagnosticsCapability::default()
                         }),
                         ..TextDocumentClientCapabilities::default()
                     }),
@@ -1047,42 +1112,37 @@ impl LanguageClient {
 
         let response: Option<GotoDefinitionResponse> = result.clone().to_lsp()?;
 
-        match response {
-            None => {
-                self.vim()?.echowarn("Not found!")?;
-                return Ok(Value::Null);
-            }
-            Some(GotoDefinitionResponse::Scalar(loc)) => {
-                self.vim()?.edit(&goto_cmd, loc.uri.filepath()?)?;
+        let locations = match response {
+            None => vec![],
+            Some(GotoDefinitionResponse::Scalar(loc)) => vec![loc],
+            Some(GotoDefinitionResponse::Array(arr)) => arr,
+            Some(GotoDefinitionResponse::Link(links)) => links
+                .into_iter()
+                .map(|link| Location::new(link.target_uri, link.target_selection_range))
+                .collect(),
+        };
+
+        match locations.len() {
+            0 => self.vim()?.echowarn("Not found!")?,
+            1 => {
+                let loc = locations.get(0).ok_or_else(|| err_msg("Not found!"))?;
+                let path = loc.uri.filepath()?.to_string_lossy().into_owned();
+                self.edit(&goto_cmd, path)?;
                 self.vim()?
                     .cursor(loc.range.start.line + 1, loc.range.start.character + 1)?;
+                let cur_file: String = self.vim()?.eval("expand('%')")?;
+                self.vim()?.echomsg_ellipsis(format!(
+                    "{} {}:{}",
+                    cur_file,
+                    loc.range.start.line + 1,
+                    loc.range.start.character + 1
+                ))?;
             }
-            Some(GotoDefinitionResponse::Array(arr)) => match arr.len() {
-                0 => self.vim()?.echowarn("Not found!")?,
-                1 => {
-                    let loc = arr.get(0).ok_or_else(|| err_msg("Not found!"))?;
-                    self.vim()?.edit(&goto_cmd, loc.uri.filepath()?)?;
-                    self.vim()?
-                        .cursor(loc.range.start.line + 1, loc.range.start.character + 1)?;
-                    let cur_file: String = self.vim()?.eval("expand('%')")?;
-                    self.vim()?.echomsg_ellipsis(format!(
-                        "{} {}:{}",
-                        cur_file,
-                        loc.range.start.line + 1,
-                        loc.range.start.character + 1
-                    ))?;
-                }
-                _ => {
-                    let title = format!("[LC]: search for {}", current_word);
-                    self.display_locations(&arr, &title)?
-                }
-            },
-            Some(GotoDefinitionResponse::Link(_)) => {
-                self.vim()?
-                    .echowarn("Definition links are not supported!")?;
-                return Ok(Value::Null);
+            _ => {
+                let title = format!("[LC]: search for {}", current_word);
+                self.display_locations(&locations, &title)?
             }
-        };
+        }
 
         info!("End {}", method);
         Ok(result)
@@ -1111,10 +1171,12 @@ impl LanguageClient {
         let result = self.get_client(&Some(languageId.clone()))?.call(
             lsp::request::Rename::METHOD,
             RenameParams {
-                text_document: TextDocumentIdentifier {
-                    uri: filename.to_url()?,
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: filename.to_url()?,
+                    },
+                    position,
                 },
-                position,
                 new_name,
             },
         )?;
@@ -1243,15 +1305,37 @@ impl LanguageClient {
             },
         )?;
 
-        let commands: Vec<Command> = serde_json::from_value(result.clone())?;
+        let response: CodeActionResponse = serde_json::from_value(result.clone())?;
 
-        let source: Vec<_> = commands
+        // Convert any Commands into CodeActions, so that the remainder of the handling can be
+        // shared.
+        let actions: Vec<_> = response
+            .into_iter()
+            .map(|action_or_command| match action_or_command {
+                CodeActionOrCommand::Command(command) => CodeAction {
+                    title: command.title.clone(),
+                    kind: Some(command.command.clone()),
+                    diagnostics: None,
+                    edit: None,
+                    command: Some(command),
+                },
+                CodeActionOrCommand::CodeAction(action) => action,
+            })
+            .collect();
+
+        let source: Vec<_> = actions
             .iter()
-            .map(|cmd| format!("{}: {}", cmd.command, cmd.title))
+            .map(|action| {
+                format!(
+                    "{}: {}",
+                    action.kind.as_ref().map_or("action", String::as_ref),
+                    action.title
+                )
+            })
             .collect();
 
         self.update(|state| {
-            state.stashed_codeAction_commands = commands;
+            state.stashed_codeAction_actions = actions;
             Ok(())
         })?;
 
@@ -1758,7 +1842,15 @@ impl LanguageClient {
             filename.remove(0);
         }
 
-        let mut diagnostics = params.diagnostics;
+        let diagnostics_max_severity = self.get(|state| state.diagnostics_max_severity)?;
+        let mut diagnostics = params
+            .diagnostics
+            .iter()
+            .filter(|&diagnostic| {
+                diagnostic.severity.unwrap_or(DiagnosticSeverity::Hint) <= diagnostics_max_severity
+            })
+            .map(Clone::clone)
+            .collect::<Vec<_>>();
         diagnostics.sort_by_key(
             // First sort by line.
             // Then severity descendingly. Error should come last since when processing item comes
@@ -1824,21 +1916,26 @@ impl LanguageClient {
 
     pub fn window_showMessageRequest(&self, params: &Value) -> Fallible<Value> {
         info!("Begin {}", lsp::request::ShowMessageRequest::METHOD);
-        let msg_params: ShowMessageRequestParams = params.clone().to_lsp()?;
-        let msg_actions = msg_params.actions.unwrap_or_default();
-        let mut options = Vec::with_capacity(msg_actions.len() + 1);
-        options.push(msg_params.message);
-        options.extend(
-            msg_actions
-                .iter()
-                .enumerate()
-                .map(|(i, item)| format!("{}) {}", i + 1, item.title)),
-        );
-
         let mut v = Value::Null;
-        let index: Option<usize> = self.vim()?.rpcclient.call("s:inputlist", options)?;
-        if let Some(index) = index {
-            v = serde_json::to_value(msg_actions.get(index - 1))?;
+        let msg_params: ShowMessageRequestParams = params.clone().to_lsp()?;
+        let msg = format!("[{:?}] {}", msg_params.typ, msg_params.message);
+        let msg_actions = msg_params.actions.unwrap_or_default();
+        if msg_actions.is_empty() {
+            self.vim()?.echomsg(&msg)?;
+        } else {
+            let mut options = Vec::with_capacity(msg_actions.len() + 1);
+            options.push(msg);
+            options.extend(
+                msg_actions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| format!("{}) {}", i + 1, item.title)),
+            );
+
+            let index: Option<usize> = self.vim()?.rpcclient.call("s:inputlist", options)?;
+            if let Some(index) = index {
+                v = serde_json::to_value(msg_actions.get(index - 1))?;
+            }
         }
 
         info!("End {}", lsp::request::ShowMessageRequest::METHOD);
@@ -2394,8 +2491,20 @@ impl LanguageClient {
         let mut edits = vec![];
         if self.get(|state| state.completionPreferTextEdit)? {
             if let Some(edit) = lspitem.text_edit {
-                self.vim()?.command("undo")?;
-                edits.push(edit.clone());
+                // The text edit should be at the completion point, and deleting the partial text
+                // that the user had typed when the language server provided the completion.
+                //
+                // We want to tweak the edit so that it instead deletes the completion that we've
+                // already inserted.
+                //
+                // Check that we're not doing anything stupid before going ahead with this.
+                let mut edit = edit.clone();
+                edit.range.end.character =
+                    edit.range.start.character + completed_item.word.len() as u64;
+                if edit.range.end != position || edit.range.start.line != edit.range.end.line {
+                    return Ok(());
+                }
+                edits.push(edit);
             };
         }
         if let Some(aedits) = lspitem.additional_text_edits {
@@ -2431,30 +2540,29 @@ impl LanguageClient {
             .split('\t')
             .next()
             .ok_or_else(|| format_err!("Failed to parse: {:?}", lines))?;
-        let mut tokens: Vec<_> = location.split_terminator(':').collect();
-        tokens.reverse();
-        let filename: String = if tokens.len() > 2 {
-            let relpath = tokens
-                .pop()
-                .ok_or_else(|| format_err!("Failed to get file path! tokens: {:?}", tokens))?
-                .to_owned();
-            let cwd: String = self.vim()?.eval("getcwd()")?;
-            Path::new(&cwd).join(relpath).to_string_lossy().into_owned()
+        let tokens: Vec<_> = location.split_terminator(':').collect();
+
+        let (filename, mut tokens_iter): (String, _) = if tokens.len() > 2 {
+            let end_index = tokens.len() - 2;
+            let path = tokens[..end_index].join(":");
+            let rest_tokens_iter = tokens[end_index..].iter();
+            (path, rest_tokens_iter)
         } else {
-            self.vim()?.get_filename(&params)?
+            (self.vim()?.get_filename(&params)?, tokens.iter())
         };
-        let line = tokens
-            .pop()
+
+        let line = tokens_iter
+            .next()
             .ok_or_else(|| format_err!("Failed to get line! tokens: {:?}", tokens))?
             .to_int()?
             - 1;
-        let character = tokens
-            .pop()
+        let character = tokens_iter
+            .next()
             .ok_or_else(|| format_err!("Failed to get character! tokens: {:?}", tokens))?
             .to_int()?
             - 1;
 
-        self.vim()?.edit(&None, &filename)?;
+        self.edit(&None, &filename)?;
         self.vim()?.cursor(line + 1, character + 1)?;
 
         info!("End {}", NOTIFICATION__FZFSinkLocation);
@@ -2466,38 +2574,46 @@ impl LanguageClient {
         let selection: String =
             try_get("selection", params)?.ok_or_else(|| err_msg("selection not found!"))?;
         let tokens: Vec<&str> = selection.splitn(2, ": ").collect();
-        let command = tokens
+        let kind = tokens
             .get(0)
             .cloned()
-            .ok_or_else(|| format_err!("Failed to get command! tokens: {:?}", tokens))?;
+            .ok_or_else(|| format_err!("Failed to get kind! tokens: {:?}", tokens))?;
         let title = tokens
             .get(1)
             .cloned()
             .ok_or_else(|| format_err!("Failed to get title! tokens: {:?}", tokens))?;
-        let entry = self.get(|state| {
-            let commands = &state.stashed_codeAction_commands;
+        let action = self.get(|state| {
+            let actions = &state.stashed_codeAction_actions;
 
-            commands
+            actions
                 .iter()
-                .find(|e| e.command == command && e.title == title)
+                .find(|action| {
+                    action.kind.as_ref().map_or(kind, String::as_ref) == kind
+                        && action.title == title
+                })
                 .cloned()
                 .ok_or_else(|| {
-                    format_err!("No stashed command found! stashed commands: {:?}", commands)
+                    format_err!("No stashed action found! stashed actions: {:?}", actions)
                 })
         })??;
 
-        if self.try_handle_command_by_client(&entry)? {
-            return Ok(());
+        // Apply edit before command.
+        if let Some(edit) = &action.edit {
+            self.apply_WorkspaceEdit(edit)?;
         }
 
-        let params = json!({
-            "command": entry.command,
-            "arguments": entry.arguments,
-        });
-        self.workspace_executeCommand(&params)?;
+        if let Some(command) = &action.command {
+            if !self.try_handle_command_by_client(&command)? {
+                let params = json!({
+                "command": command.command,
+                "arguments": command.arguments,
+                });
+                self.workspace_executeCommand(&params)?;
+            }
+        }
 
         self.update(|state| {
-            state.stashed_codeAction_commands = vec![];
+            state.stashed_codeAction_actions = vec![];
             Ok(())
         })?;
 
@@ -2930,6 +3046,27 @@ impl LanguageClient {
         let content: String = self
             .get_client(&Some(languageId.clone()))?
             .call(REQUEST__ClassFileContents, params)?;
+
+        let lines: Vec<String> = content
+            .lines()
+            .map(std::string::ToString::to_string)
+            .collect();
+
+        let goto_cmd = self
+            .vim()?
+            .get_goto_cmd(params)?
+            .unwrap_or_else(|| "edit".to_string());
+
+        let uri: String =
+            try_get("uri", params)?.ok_or_else(|| err_msg("uri not found in request!"))?;
+
+        self.vim()?
+            .rpcclient
+            .notify("s:Edit", json!([goto_cmd, uri]))?;
+
+        self.vim()?.setline(1, &lines)?;
+        self.vim()?
+            .command("setlocal buftype=nofile filetype=java noswapfile")?;
 
         info!("End {}", REQUEST__ClassFileContents);
         Ok(Value::String(content))
